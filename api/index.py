@@ -29,8 +29,6 @@ class TimetableGenerator:
         self.days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
         self.time_slots = self._generate_time_slots()
         self.status_messages = []
-        
-        # Structure: bookings[Day][Time] = {Set of occupied Room IDs}
         self.room_bookings = defaultdict(lambda: defaultdict(set))
     
     def log_status(self, message: str):
@@ -62,7 +60,7 @@ class TimetableGenerator:
         return slots
     
     def parse_excel(self, file_content: bytes) -> Dict:
-        """Parse Excel file and validate data"""
+        """Parse Excel file and validate data strictness"""
         try:
             self.log_status("📂 Reading Excel file...")
             excel_file = pd.ExcelFile(io.BytesIO(file_content), engine='openpyxl')
@@ -71,13 +69,17 @@ class TimetableGenerator:
             missing_sheets = [s for s in required_sheets if s not in excel_file.sheet_names]
             
             if missing_sheets:
-                raise ValueError(f"❌ Missing sheets: {', '.join(missing_sheets)}")
+                raise ValueError(f"Excel sheet fault: Missing sheets: {', '.join(missing_sheets)}")
             
             session_df = pd.read_excel(excel_file, sheet_name='session')
             teacher_df = pd.read_excel(excel_file, sheet_name='Teacher')
             sections_df = pd.read_excel(excel_file, sheet_name='Sections')
             rooms_df = pd.read_excel(excel_file, sheet_name='rooms')
             
+            # === STRICT VALIDATION CHECKS ===
+            if teacher_df.empty or sections_df.empty or rooms_df.empty:
+                raise ValueError("Excel sheet fault: One of the required sheets (Teacher, Sections, rooms) is empty.")
+
             return {
                 'session': session_df,
                 'teacher': teacher_df,
@@ -90,16 +92,21 @@ class TimetableGenerator:
             raise
     
     def build_teacher_mapping(self, teacher_df: pd.DataFrame) -> Dict[str, List[Dict]]:
-        """Build mapping of subjects to teachers"""
+        """Build mapping of subjects to teachers with strict validation"""
         mapping = defaultdict(list)
         for idx, row in teacher_df.iterrows():
             teacher_name = str(row.get('Nmae', row.get('Name', 'Unknown'))).strip()
             courses = str(row.get('courses', '')).strip()
             credit_hours = row.get('credit hours', 0)
             
-            if not teacher_name or pd.isna(teacher_name):
-                continue
+            # FAULT CHECK: Missing Teacher Name
+            if not teacher_name or pd.isna(teacher_name) or teacher_name.lower() == 'unknown':
+                raise ValueError(f"Excel sheet fault: Teacher name missing at row {idx + 2}")
             
+            # FAULT CHECK: Missing Courses
+            if not courses or pd.isna(courses):
+                 raise ValueError(f"Excel sheet fault: No courses assigned to teacher '{teacher_name}'")
+
             course_list = [c.strip() for c in courses.split(',') if c.strip()]
             for course in course_list:
                 mapping[course].append({
@@ -121,7 +128,7 @@ class TimetableGenerator:
             r_id = str(room.get('room id', 'Unknown'))
             r_type = str(room.get('type', '')).lower()
             
-            # 1. Check Type Match
+            # Check Type Match
             type_match = False
             if is_lab:
                 if 'lab' in r_type or 'lab' in r_id.lower():
@@ -133,9 +140,9 @@ class TimetableGenerator:
             if not type_match:
                 continue
 
-            # 2. Check Availability for ALL consecutive slots
+            # Check Availability
             if self.check_room_availability(r_id, day, times):
-                # Book it for all slots
+                # Book it
                 for t in times:
                     self.room_bookings[day][t].add(r_id)
                 return r_id
@@ -144,12 +151,11 @@ class TimetableGenerator:
 
     def generate_timetables(self, sections_df: pd.DataFrame, teacher_mapping: Dict, rooms_df: pd.DataFrame) -> Dict[str, List[Dict]]:
         try:
-            self.log_status("📅 Generating timetables with Logic (Labs=3hrs)...")
+            self.log_status("📅 Generating timetables...")
             timetables = {}
             all_rooms = rooms_df.to_dict('records')
             self.room_bookings = defaultdict(lambda: defaultdict(set))
             
-            # Master list of slots
             all_possible_slots = []
             for day in self.days:
                 for slot in self.time_slots[day]:
@@ -162,62 +168,58 @@ class TimetableGenerator:
                 section = str(row.get('Section', f'Section_{idx}')).strip()
                 raw_subjects = str(row.get('Subject', '')).strip()
                 
-                if not section or not raw_subjects or pd.isna(raw_subjects):
-                    continue
-                    
+                # FAULT CHECK: Missing Section or Subject
+                if not section or pd.isna(section) or section == 'nan':
+                     raise ValueError(f"Excel sheet fault: Missing Section Name at row {idx + 2}")
+                if not raw_subjects or pd.isna(raw_subjects):
+                     raise ValueError(f"Excel sheet fault: Missing Subjects for section '{section}'")
+
                 subject_list = [s.strip() for s in raw_subjects.split(',') if s.strip()]
 
                 for subject in subject_list:
                     teachers = teacher_mapping.get(subject, [])
-                    teacher_name = teachers[0]['name'] if teachers else "TBA"
+                    
+                    # FAULT CHECK: Missing Teacher for Subject
+                    if not teachers:
+                        raise ValueError(f"Excel sheet fault: No teacher found for subject '{subject}' in section '{section}'")
+
+                    teacher_name = teachers[0]['name']
                     try:
-                        credit_hours = int(teachers[0].get('credit_hours', 3)) if teachers else 3
+                        credit_hours = int(teachers[0].get('credit_hours', 3))
                     except:
                         credit_hours = 3
 
-                    # === NEW LOGIC: DETECT LAB ===
-                    # Check if subject ends with "Lab" (case insensitive)
                     is_lab = subject.lower().strip().endswith('lab') or 'lab' in subject.lower()
 
                     if is_lab:
-                        # === LOGIC FOR LABS (3 Consecutive Hours) ===
+                        # === LAB LOGIC (3 Hours) ===
                         lab_duration = 3
                         scheduled = False
                         
-                        # Search for a block of 3 slots
-                        # We try to start from current_slot_index to keep distribution fair, 
-                        # but we scan forward until we find a fit.
                         attempts = 0
                         start_search_index = current_slot_index
                         
                         while attempts < total_slots:
                             idx_check = (start_search_index + attempts) % total_slots
                             
-                            # Check boundaries: Can we fit 3 slots without wrapping days?
                             if idx_check + lab_duration > len(all_possible_slots):
                                 attempts += 1
                                 continue
                                 
                             slots_to_check = all_possible_slots[idx_check : idx_check + lab_duration]
-                            
-                            # Verify all slots are on the same day
                             first_day = slots_to_check[0]['day']
+                            
                             if not all(s['day'] == first_day for s in slots_to_check):
                                 attempts += 1
                                 continue
                             
-                            # Verify slots are consecutive in time (e.g., 8, 9, 10)
-                            # (Our list is ordered, so indices usually guarantee this, but good to be safe)
-                            
-                            # Format Times
                             time_strings = [f"{s['time'][0]}:00-{s['time'][1]}:00" for s in slots_to_check]
-                            
-                            # Find Room for this BLOCK
                             room_id = self.find_and_book_room(first_day, time_strings, True, all_rooms)
                             
                             if room_id != "TBA":
-                                # Found a spot! Schedule it.
-                                display_room = "[LAB (Decide: LabE/Lab2)]"
+                                # SUCCESS: Booked
+                                # CHANGE: Simple [LAB] display
+                                display_room = "[LAB]"
                                 
                                 for i, slot_obj in enumerate(slots_to_check):
                                     t_str = time_strings[i]
@@ -231,55 +233,68 @@ class TimetableGenerator:
                                     })
                                 
                                 scheduled = True
-                                # Advance the global counter roughly past this block
                                 current_slot_index = (idx_check + lab_duration) % total_slots
                                 break
-                            
                             attempts += 1
                         
+                        # SOLVABILITY CHECK
                         if not scheduled:
-                            self.log_status(f"⚠️ Could not find 3 consecutive slots for Lab: {subject}")
+                            raise ValueError(f"not possible") 
 
                     else:
-                        # === LOGIC FOR THEORY (Normal Credit Hours) ===
+                        # === THEORY LOGIC ===
                         for i in range(credit_hours):
-                            safe_index = current_slot_index % total_slots
-                            selected_slot = all_possible_slots[safe_index]
+                            attempts = 0
+                            scheduled_hour = False
                             
-                            day = selected_slot['day']
-                            time_slot_tuple = selected_slot['time']
-                            formatted_time = f"{time_slot_tuple[0]}:00-{time_slot_tuple[1]}:00"
+                            while attempts < total_slots:
+                                safe_index = current_slot_index % total_slots
+                                selected_slot = all_possible_slots[safe_index]
+                                
+                                day = selected_slot['day']
+                                time_slot_tuple = selected_slot['time']
+                                formatted_time = f"{time_slot_tuple[0]}:00-{time_slot_tuple[1]}:00"
+                                
+                                room_id = self.find_and_book_room(day, [formatted_time], False, all_rooms)
+                                
+                                if room_id != "TBA":
+                                    display_room = f"[{room_id}]"
+                                    
+                                    current_slot_index += 1
+                                    
+                                    if section not in timetables: timetables[section] = []
+                                    timetables[section].append({
+                                        'subject': subject,
+                                        'teacher': teacher_name,
+                                        'day': day,
+                                        'time': formatted_time,
+                                        'room': display_room
+                                    })
+                                    scheduled_hour = True
+                                    break
+                                else:
+                                    # Slot occupied or no room, try next slot
+                                    current_slot_index += 1
+                                    attempts += 1
                             
-                            # Find Room (Theory) - 1 hour at a time
-                            room_id = self.find_and_book_room(day, [formatted_time], False, all_rooms)
-                            display_room = f"[{room_id}]"
-                            
-                            current_slot_index += 1
-                            
-                            if section not in timetables:
-                                timetables[section] = []
-                            
-                            timetables[section].append({
-                                'subject': subject,
-                                'teacher': teacher_name,
-                                'day': day,
-                                'time': formatted_time,
-                                'room': display_room
-                            })
-            
-            self.log_status(f"✅ Generated timetables for {len(timetables)} sections")
+                            # SOLVABILITY CHECK
+                            if not scheduled_hour:
+                                raise ValueError(f"not possible")
+
             return timetables
         
+        except ValueError as ve:
+            # Re-raise known logic errors (faults or not possible)
+            raise ve
         except Exception as e:
             self.log_status(f"❌ Error generating timetables: {str(e)}")
             raise
-    
+
     def generate_word_document(self, timetables: Dict[str, List[Dict]]) -> bytes:
         """Generate Word document with timetables"""
         try:
             self.log_status("📄 Generating Word document...")
             doc = Document()
-            
             title = doc.add_heading('University Timetable', 0)
             title.alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph(f'Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
@@ -335,42 +350,41 @@ class TimetableGenerator:
 # ==================== API ENDPOINTS ====================
 @app.get("/")
 def root():
-    return {"message": "Timetable Generator API is Running", "version": "1.4"}
+    return {"message": "Timetable Generator API is Running", "version": "1.5"}
 
 @app.post("/generate-timetable")
 async def generate_timetable(file: UploadFile = File(...)):
     """Generate timetable from Excel file"""
     try:
         generator = TimetableGenerator()
-        generator.log_status("🚀 Starting timetable generation...")
-        
         file_content = await file.read()
-        generator.log_status(f"📧 Received file: {file.filename}")
         
         data = generator.parse_excel(file_content)
         teacher_mapping = generator.build_teacher_mapping(data['teacher'])
         timetables = generator.generate_timetables(data['sections'], teacher_mapping, data['rooms'])
         
-        if not timetables:
-            return {
-                "status": "error",
-                "message": "No timetables could be generated.",
-                "messages": generator.status_messages
-            }
-        
         word_content = generator.generate_word_document(timetables)
+        
+        temp_path = f"timetable_output.docx"
+        with open(temp_path, 'wb') as f:
+            f.write(word_content)
+        
         return {
             "status": "success",
             "message": "Timetable generated successfully",
-            "messages": generator.status_messages,
             "sections_processed": len(timetables)
         }
     
+    except ValueError as ve:
+        # Return strict fault messages to the user
+        return {
+            "status": "error",
+            "message": str(ve)  # This will be "Excel sheet fault..." or "not possible"
+        }
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Server Error: {str(e)}",
-            "messages": generator.status_messages if 'generator' in locals() else []
+            "message": f"Server Error: {str(e)}"
         }
 
 @app.post("/download-timetable")
@@ -378,14 +392,14 @@ async def download_timetable(file: UploadFile = File(...)):
     try:
         generator = TimetableGenerator()
         file_content = await file.read()
+        
+        # All validation happens inside these calls now
         data = generator.parse_excel(file_content)
         teacher_mapping = generator.build_teacher_mapping(data['teacher'])
         timetables = generator.generate_timetables(data['sections'], teacher_mapping, data['rooms'])
         
-        if not timetables:
-            raise HTTPException(status_code=400, detail="No timetables generated")
-        
         word_content = generator.generate_word_document(timetables)
+        
         output = io.BytesIO(word_content)
         output.seek(0)
         filename = f"Timetable_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
@@ -395,8 +409,13 @@ async def download_timetable(file: UploadFile = File(...)):
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
+    
+    except ValueError as ve:
+        # Pass the exact error message (fault/not possible) to Bubble via 400 Bad Request
+        raise HTTPException(status_code=400, detail=str(ve))
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

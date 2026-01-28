@@ -6,7 +6,7 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 from collections import defaultdict
 import json
 from datetime import datetime
@@ -29,6 +29,10 @@ class TimetableGenerator:
         self.days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
         self.time_slots = self._generate_time_slots()
         self.status_messages = []
+        
+        # NEW: Track room bookings to prevent conflicts
+        # Structure: bookings[Day][Time] = {Set of occupied Room IDs}
+        self.room_bookings = defaultdict(lambda: defaultdict(set))
     
     def log_status(self, message: str):
         """Log status messages for debugging"""
@@ -126,18 +130,51 @@ class TimetableGenerator:
         except Exception as e:
             self.log_status(f"❌ Error building teacher mapping: {str(e)}")
             raise
-    
-    def generate_timetables(self, sections_df: pd.DataFrame, teacher_mapping: Dict) -> Dict[str, List[Dict]]:
+
+    def get_available_room(self, day: str, time_slot: str, is_lab: bool, all_rooms: List[Dict]) -> str:
+        """Finds a free room of the correct type (KE/Theory vs Lab)"""
+        
+        for room in all_rooms:
+            r_id = str(room.get('room id', 'Unknown'))
+            r_type = str(room.get('type', '')).lower()
+            
+            # 1. Check if Room Type matches the Subject Type
+            type_match = False
+            if is_lab:
+                # If subject is a Lab, we need a room with 'lab' in its type or ID
+                if 'lab' in r_type or 'lab' in r_id.lower():
+                    type_match = True
+            else:
+                # If subject is Theory, we need 'KE', 'Class', etc. (Not a lab)
+                if ('ke' in r_type or 'ke' in r_id.lower() or 'class' in r_type) and 'lab' not in r_type:
+                    type_match = True
+            
+            if not type_match:
+                continue
+
+            # 2. Check Availability (Is this room free at this time?)
+            if r_id not in self.room_bookings[day][time_slot]:
+                # Book the room
+                self.room_bookings[day][time_slot].add(r_id)
+                return r_id
+        
+        return "TBA" # No room found
+
+    def generate_timetables(self, sections_df: pd.DataFrame, teacher_mapping: Dict, rooms_df: pd.DataFrame) -> Dict[str, List[Dict]]:
         """
-        Generate timetables for each section using a safe Round-Robin approach.
-        NOW UPDATED: Schedules multiple lectures based on credit hours.
+        Generate timetables for each section with Room Allocation.
         """
         try:
             self.log_status("📅 Generating timetables...")
             timetables = {}
             
+            # Convert rooms dataframe to list of dicts for faster looping
+            all_rooms = rooms_df.to_dict('records')
+
+            # Reset bookings
+            self.room_bookings = defaultdict(lambda: defaultdict(set))
+            
             # 1. CREATE MASTER LIST OF ALL AVAILABLE SLOTS
-            # Format: [{'day': 'Monday', 'time': (8,9)}, ...]
             all_possible_slots = []
             for day in self.days:
                 for slot in self.time_slots[day]:
@@ -147,13 +184,11 @@ class TimetableGenerator:
             if total_slots == 0:
                 raise ValueError("No time slots defined in logic!")
 
-            # Global counter to distribute classes evenly across the week
+            # Global counter to distribute classes evenly
             current_slot_index = 0
             
             for idx, row in sections_df.iterrows():
                 section = str(row.get('Section', f'Section_{idx}')).strip()
-                
-                # Your file has multiple subjects in one cell (e.g., "DM,CA")
                 raw_subjects = str(row.get('Subject', '')).strip()
                 
                 if not section or not raw_subjects or pd.isna(raw_subjects):
@@ -162,27 +197,27 @@ class TimetableGenerator:
                 subject_list = [s.strip() for s in raw_subjects.split(',') if s.strip()]
 
                 for subject in subject_list:
-                    # Get teacher(s) for this subject
+                    # Get teacher
                     teachers = teacher_mapping.get(subject, [])
-                    
-                    # Default if no teacher found
                     teacher_name = "TBA"
                     credit_hours = 3
+                    
                     if teachers:
                         teacher_name = teachers[0]['name']
-                        # FORCE INTEGER CASTING FOR CREDIT HOURS
                         try:
                             credit_hours = int(teachers[0].get('credit_hours', 3))
                         except:
-                            credit_hours = 3 # fallback safety
+                            credit_hours = 3
                     else:
                         self.log_status(f"⚠️  No teacher found for {subject}")
 
-                    # --- NEW LOGIC START ---
-                    # Loop 'credit_hours' times to assign multiple slots
+                    # Check if this subject is a LAB
+                    is_lab = 'lab' in subject.lower()
+
+                    # Schedule multiple lectures based on credit hours
                     for i in range(credit_hours):
                         
-                        # Use modulo (%) to wrap around to Monday if we pass Friday
+                        # Select Slot (Round Robin)
                         safe_index = current_slot_index % total_slots
                         selected_slot = all_possible_slots[safe_index]
                         
@@ -190,7 +225,17 @@ class TimetableGenerator:
                         time_slot_tuple = selected_slot['time']
                         formatted_time = f"{time_slot_tuple[0]}:00-{time_slot_tuple[1]}:00"
                         
-                        # Increment counter for next class
+                        # === FIND A ROOM ===
+                        assigned_room_id = self.get_available_room(day, formatted_time, is_lab, all_rooms)
+                        
+                        # Custom Display Logic for Labs
+                        display_room = f"[{assigned_room_id}]"
+                        if is_lab:
+                            # Even if we booked a specific lab (e.g. LabE) to reserve space,
+                            # we display the generic instruction as requested.
+                            display_room = "[LAB (Decide: LabE/Lab2)]"
+                        
+                        # Increment counter
                         current_slot_index += 1
                         
                         if section not in timetables:
@@ -201,9 +246,8 @@ class TimetableGenerator:
                             'teacher': teacher_name,
                             'day': day,
                             'time': formatted_time,
-                            'credit_hours': credit_hours
+                            'room': display_room  # Save room info
                         })
-                    # --- NEW LOGIC END ---
             
             self.log_status(f"✅ Generated timetables for {len(timetables)} sections")
             return timetables
@@ -239,17 +283,20 @@ class TimetableGenerator:
                 for i, day in enumerate(self.days, 1):
                     header_cells[i].text = day
                 
-                # Organize data: schedule[day][time] = "Subject (Teacher)"
+                # Organize data
                 schedule = defaultdict(lambda: defaultdict(str))
                 all_times = set()
                 
                 for cls in classes:
-                    # Append if multiple classes end up in same slot (collision handling)
+                    # Content format: Subject \n (Teacher) \n [Room]
+                    entry_text = f"{cls['subject']}\n({cls['teacher']})\n{cls['room']}"
+                    
                     existing = schedule[cls['day']][cls['time']]
                     if existing:
-                        schedule[cls['day']][cls['time']] = existing + f"\n{cls['subject']}"
+                        schedule[cls['day']][cls['time']] = existing + f"\n\n{entry_text}"
                     else:
-                        schedule[cls['day']][cls['time']] = f"{cls['subject']}\n({cls['teacher']})"
+                        schedule[cls['day']][cls['time']] = entry_text
+                        
                     all_times.add(cls['time'])
                 
                 # Add Standard Breaks
@@ -292,7 +339,7 @@ class TimetableGenerator:
 # ==================== API ENDPOINTS ====================
 @app.get("/")
 def root():
-    return {"message": "Timetable Generator API is Running", "version": "1.2"}
+    return {"message": "Timetable Generator API is Running", "version": "1.3"}
 
 @app.post("/generate-timetable")
 async def generate_timetable(file: UploadFile = File(...)):
@@ -311,8 +358,8 @@ async def generate_timetable(file: UploadFile = File(...)):
         # Build teacher mapping
         teacher_mapping = generator.build_teacher_mapping(data['teacher'])
         
-        # Generate timetables
-        timetables = generator.generate_timetables(data['sections'], teacher_mapping)
+        # Generate timetables (PASSING ROOMS NOW)
+        timetables = generator.generate_timetables(data['sections'], teacher_mapping, data['rooms'])
         
         if not timetables:
             return {
@@ -324,7 +371,7 @@ async def generate_timetable(file: UploadFile = File(...)):
         # Generate Word document
         word_content = generator.generate_word_document(timetables)
         
-        # Save to temporary file (Optional: good for debugging)
+        # Save to temporary file
         temp_path = f"timetable_output.docx"
         with open(temp_path, 'wb') as f:
             f.write(word_content)
@@ -352,7 +399,9 @@ async def download_timetable(file: UploadFile = File(...)):
         file_content = await file.read()
         data = generator.parse_excel(file_content)
         teacher_mapping = generator.build_teacher_mapping(data['teacher'])
-        timetables = generator.generate_timetables(data['sections'], teacher_mapping)
+        
+        # Generate timetables (PASSING ROOMS NOW)
+        timetables = generator.generate_timetables(data['sections'], teacher_mapping, data['rooms'])
         
         if not timetables:
             raise HTTPException(status_code=400, detail="No timetables generated")
@@ -376,8 +425,6 @@ async def download_timetable(file: UploadFile = File(...)):
 # ==================== MAIN EXECUTION (RAILWAY COMPATIBLE) ====================
 if __name__ == "__main__":
     import uvicorn
-    # Get port from environment variable or default to 8000
-    # The '0.0.0.0' host is CRITICAL for Railway
     port = int(os.environ.get("PORT", 8000))
     print(f"🚀 Starting server on 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)

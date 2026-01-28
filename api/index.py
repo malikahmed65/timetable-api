@@ -130,7 +130,7 @@ class TimetableGenerator:
     def generate_timetables(self, sections_df: pd.DataFrame, teacher_mapping: Dict) -> Dict[str, List[Dict]]:
         """
         Generate timetables for each section using a safe Round-Robin approach.
-        This fixes the IndexError crash by wrapping around if slots run out.
+        NOW UPDATED: Schedules multiple lectures based on credit hours.
         """
         try:
             self.log_status("📅 Generating timetables...")
@@ -154,7 +154,6 @@ class TimetableGenerator:
                 section = str(row.get('Section', f'Section_{idx}')).strip()
                 
                 # Your file has multiple subjects in one cell (e.g., "DM,CA")
-                # We need to split them to schedule each one
                 raw_subjects = str(row.get('Subject', '')).strip()
                 
                 if not section or not raw_subjects or pd.isna(raw_subjects):
@@ -171,32 +170,40 @@ class TimetableGenerator:
                     credit_hours = 3
                     if teachers:
                         teacher_name = teachers[0]['name']
-                        credit_hours = teachers[0].get('credit_hours', 3)
+                        # FORCE INTEGER CASTING FOR CREDIT HOURS
+                        try:
+                            credit_hours = int(teachers[0].get('credit_hours', 3))
+                        except:
+                            credit_hours = 3 # fallback safety
                     else:
                         self.log_status(f"⚠️  No teacher found for {subject}")
 
-                    # 2. SAFE SLOT SELECTION (Round Robin)
-                    # Use modulo (%) to wrap around to Monday if we pass Friday
-                    safe_index = current_slot_index % total_slots
-                    selected_slot = all_possible_slots[safe_index]
-                    
-                    day = selected_slot['day']
-                    time_slot_tuple = selected_slot['time']
-                    formatted_time = f"{time_slot_tuple[0]}:00-{time_slot_tuple[1]}:00"
-                    
-                    # Increment counter for next class
-                    current_slot_index += 1
-                    
-                    if section not in timetables:
-                        timetables[section] = []
-                    
-                    timetables[section].append({
-                        'subject': subject,
-                        'teacher': teacher_name,
-                        'day': day,
-                        'time': formatted_time,
-                        'credit_hours': credit_hours
-                    })
+                    # --- NEW LOGIC START ---
+                    # Loop 'credit_hours' times to assign multiple slots
+                    for i in range(credit_hours):
+                        
+                        # Use modulo (%) to wrap around to Monday if we pass Friday
+                        safe_index = current_slot_index % total_slots
+                        selected_slot = all_possible_slots[safe_index]
+                        
+                        day = selected_slot['day']
+                        time_slot_tuple = selected_slot['time']
+                        formatted_time = f"{time_slot_tuple[0]}:00-{time_slot_tuple[1]}:00"
+                        
+                        # Increment counter for next class
+                        current_slot_index += 1
+                        
+                        if section not in timetables:
+                            timetables[section] = []
+                        
+                        timetables[section].append({
+                            'subject': subject,
+                            'teacher': teacher_name,
+                            'day': day,
+                            'time': formatted_time,
+                            'credit_hours': credit_hours
+                        })
+                    # --- NEW LOGIC END ---
             
             self.log_status(f"✅ Generated timetables for {len(timetables)} sections")
             return timetables
@@ -232,17 +239,22 @@ class TimetableGenerator:
                 for i, day in enumerate(self.days, 1):
                     header_cells[i].text = day
                 
-                # Organize data for easier writing: schedule[day][time] = "Subject (Teacher)"
+                # Organize data: schedule[day][time] = "Subject (Teacher)"
                 schedule = defaultdict(lambda: defaultdict(str))
                 all_times = set()
                 
                 for cls in classes:
-                    schedule[cls['day']][cls['time']] = f"{cls['subject']}\n({cls['teacher']})"
+                    # Append if multiple classes end up in same slot (collision handling)
+                    existing = schedule[cls['day']][cls['time']]
+                    if existing:
+                        schedule[cls['day']][cls['time']] = existing + f"\n{cls['subject']}"
+                    else:
+                        schedule[cls['day']][cls['time']] = f"{cls['subject']}\n({cls['teacher']})"
                     all_times.add(cls['time'])
                 
                 # Add Standard Breaks
                 all_times.add('12:00-13:00')
-                all_times.add('13:00-14:00') # ensure 1-2 gap covers Fri prayer if needed
+                all_times.add('13:00-14:00') 
                 
                 # Sort times numerically
                 times_list = sorted(list(all_times), key=lambda x: int(x.split(':')[0]))
@@ -280,7 +292,7 @@ class TimetableGenerator:
 # ==================== API ENDPOINTS ====================
 @app.get("/")
 def root():
-    return {"message": "Timetable Generator API is Running", "version": "1.1"}
+    return {"message": "Timetable Generator API is Running", "version": "1.2"}
 
 @app.post("/generate-timetable")
 async def generate_timetable(file: UploadFile = File(...)):

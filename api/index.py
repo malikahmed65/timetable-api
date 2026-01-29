@@ -11,6 +11,8 @@ from collections import defaultdict
 import json
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
+#this is added
+app = FastAPI(title="Timetable Generator")
 
 # This allows your new frontend to talk to your Python backend
 app.add_middleware(
@@ -19,7 +21,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app = FastAPI(title="Timetable Generator")
 
 # ==================== DATA STRUCTURES ====================
 class TimeSlot:

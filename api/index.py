@@ -10,7 +10,15 @@ from typing import Dict, List, Tuple, Set
 from collections import defaultdict
 import json
 from datetime import datetime
+from fastapi.middleware.cors import CORSMiddleware
 
+# This allows your new frontend to talk to your Python backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # For production, replace "*" with your actual Bolt/Vercel URL
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app = FastAPI(title="Timetable Generator")
 
 # ==================== DATA STRUCTURES ====================

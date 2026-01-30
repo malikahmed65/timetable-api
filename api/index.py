@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 import pandas as pd
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import os
 from collections import defaultdict
@@ -21,6 +22,7 @@ class TimetableGenerator:
     def __init__(self):
         self.days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
         self.hours = list(range(8, 16))
+        # Tracking to prevent room, teacher, and section overlaps
         self.room_bookings = defaultdict(lambda: defaultdict(set))
         self.teacher_bookings = defaultdict(lambda: defaultdict(set))
         self.section_bookings = defaultdict(lambda: defaultdict(set))
@@ -29,6 +31,7 @@ class TimetableGenerator:
         try:
             excel_file = pd.ExcelFile(io.BytesIO(file_content), engine='openpyxl')
             required = ['Teacher', 'Sections', 'rooms']
+            # Strict validation for required sheets
             if not all(s in excel_file.sheet_names for s in required):
                 raise ValueError("excel sheet fault")
             
@@ -44,6 +47,7 @@ class TimetableGenerator:
         timetables = defaultdict(list)
         all_rooms = data['rooms'].to_dict('records')
         
+        # Build teacher mapping with credit hour logic
         teacher_map = {}
         for _, row in data['teacher'].iterrows():
             name = str(row.get('Name', row.get('Nmae', ''))).strip()
@@ -71,10 +75,10 @@ class TimetableGenerator:
                 teacher = t_data["name"]
                 is_lab = sub.lower().endswith('lab')
                 
-                # Logic: If lab, schedule 2 sessions of 3 hours. Otherwise, 1 session of 'credit_hours'.
+                # Setup sessions: Labs get 2 sessions (Odd/Even), Others get 1 block based on Credit Hours
                 sessions_to_schedule = []
                 if is_lab:
-                    # Logic for Odd/Even Roll Numbers
+                    # Creating two 3-hour sessions for split roll numbers
                     sessions_to_schedule.append({"name": f"{sub} (Odd Roll#)", "dur": 3})
                     sessions_to_schedule.append({"name": f"{sub} (Even Roll#)", "dur": 3})
                 else:
@@ -85,14 +89,15 @@ class TimetableGenerator:
                     duration = session_info["dur"]
                     scheduled = False
                     
+                    # Flexible search across all days to utilize empty slots/free days
                     for day in self.days:
                         if scheduled: break
                         
-                        # Rule: Teachers ending in "main" skip 8:00 AM
+                        # Rule: Teachers ending in "main" cannot start at 8 AM
                         start_search = 9 if teacher.lower().endswith('main') else 8
                         
                         for start_h in range(start_search, 16 - duration + 1):
-                            # Break Logic
+                            # Break constraints (12-1 PM Daily, 12-2 PM Friday)
                             if any(12 <= h < (14 if day == 'Friday' else 13) for h in range(start_h, start_h + duration)):
                                 continue
 
@@ -103,7 +108,7 @@ class TimetableGenerator:
                                 r_id = str(r.get('room id', ''))
                                 r_type = str(r.get('type', '')).lower()
                                 
-                                # Room type match
+                                # Room type matching: Lab sessions must use 'lab' rooms
                                 if is_lab != ('lab' in r_type): continue
 
                                 if all(r_id not in self.room_bookings[day][s] and 
@@ -129,6 +134,7 @@ class TimetableGenerator:
                                 scheduled = True
                                 break
                     
+                    # If any session cannot be placed anywhere in the week
                     if not scheduled:
                         raise ValueError("not possible")
 
@@ -137,12 +143,13 @@ class TimetableGenerator:
     def generate_word_doc(self, timetables):
         doc = Document()
         for section, entries in sorted(timetables.items()):
-            doc.add_heading(f'Section: {section}', level=1)
+            title = doc.add_heading(f'Section: {section}', level=1)
+            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
             table = doc.add_table(rows=1, cols=6)
             table.style = 'Table Grid'
             hdr_cells = table.rows[0].cells
             hdr_cells[0].text = 'Time'
-            for i, day in enumerate(self.days): hdr_cells[i+1].text = day
+            for i, d in enumerate(self.days): hdr_cells[i+1].text = d
 
             lookup = defaultdict(str)
             for e in entries:
@@ -172,9 +179,13 @@ async def handle_download(file: UploadFile = File(...)):
         data = gen.parse_excel(await file.read())
         timetables = gen.generate_timetables(data)
         doc_io = gen.generate_word_doc(timetables)
-        return StreamingResponse(doc_io, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", 
-                                 headers={"Content-Disposition": "attachment; filename=timetable.docx"})
+        return StreamingResponse(
+            doc_io, 
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", 
+            headers={"Content-Disposition": "attachment; filename=timetable.docx"}
+        )
     except ValueError as ve:
+        # Standardized error messages as requested
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception:
         raise HTTPException(status_code=400, detail="excel sheet fault")

@@ -3,6 +3,7 @@ uvicorn
 gunicorn
 pandas>=2.2.0
 numpy<2.0.0
+
 python-docx
 openpyxl
 python-multipart

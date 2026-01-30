@@ -21,8 +21,8 @@ app.add_middleware(
 class TimetableGenerator:
     def __init__(self):
         self.days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-        # Slots cover 8 AM to 4 PM (16:00)
-        self.hours = list(range(8, 16))
+        # Extended hours to 17:00 (5 PM) to accommodate 3-hour labs after Friday break
+        self.hours = list(range(8, 17)) 
         self.room_bookings = defaultdict(lambda: defaultdict(set))
         self.teacher_bookings = defaultdict(lambda: defaultdict(set))
         self.section_bookings = defaultdict(lambda: defaultdict(set))
@@ -70,14 +70,13 @@ class TimetableGenerator:
 
                 is_lab = sub.lower().endswith('lab')
                 if is_lab:
-                    # Split into Odd and Even roll number sessions
+                    # Creating two sessions for split roll numbers
                     all_sessions.append({'section': section, 'name': f"{sub} (Odd Roll#)", 'dur': 3, 'teacher': t_data['name'], 'is_lab': True})
                     all_sessions.append({'section': section, 'name': f"{sub} (Even Roll#)", 'dur': 3, 'teacher': t_data['name'], 'is_lab': True})
                 else:
-                    # Theory based on credit hours
                     all_sessions.append({'section': section, 'name': sub, 'dur': t_data['credit_hours'], 'teacher': t_data['name'], 'is_lab': False})
 
-        # CRITICAL: Sort by duration (Longest first) so 3-hour labs get first pick of the days
+        # Priority sort: Labs first
         all_sessions.sort(key=lambda x: x['dur'], reverse=True)
 
         for session in all_sessions:
@@ -92,14 +91,15 @@ class TimetableGenerator:
                 # Rule: Teachers ending in "main" start from 9 AM
                 start_search = 9 if teacher.lower().endswith('main') else 8
                 
-                for start_h in range(start_search, 17 - duration): # Search up to 4 PM
-                    # Strict Break Check: 12-1 PM (Daily) and 12-2 PM (Friday Jummah)
+                for start_h in range(start_search, 18 - duration): 
                     end_h = start_h + duration
+                    
+                    # Corrected Break Logic for Daily and Friday Jummah
                     has_break_clash = False
                     for h in range(start_h, end_h):
-                        if h == 12: # Daily Lunch Break
+                        if h == 12: # Standard Break
                             has_break_clash = True
-                        if day == 'Friday' and (h == 12 or h == 13): # Friday Jummah Break
+                        if day == 'Friday' and (h == 12 or h == 13): # Extended Friday Break
                             has_break_clash = True
                     
                     if has_break_clash:
@@ -112,7 +112,6 @@ class TimetableGenerator:
                         r_id = str(r.get('room id', ''))
                         r_type = str(r.get('type', '')).lower()
                         
-                        # Match lab sessions to rooms with "lab" in type
                         if is_lab != ('lab' in r_type): continue
 
                         if all(r_id not in self.room_bookings[day][s] and 
@@ -137,7 +136,7 @@ class TimetableGenerator:
                         break
             
             if not scheduled:
-                print(f"DEBUG FAIL: {session['name']} for {session['section']} (Teacher: {teacher})")
+                print(f"FAILED TO PLACE: {session['name']} for {session['section']} ({teacher})")
                 raise ValueError("not possible")
 
         return timetables
@@ -159,7 +158,8 @@ class TimetableGenerator:
                 for h in range(start_h, end_h):
                     lookup[(e['day'], f"{h}:00")] = f"{e['subject']}\n({e['teacher']})\n{e['room']}"
 
-            for h in range(8, 16):
+            # Table display extended to 17:00 (5 PM)
+            for h in range(8, 17): 
                 row_cells = table.add_row().cells
                 row_cells[0].text = f"{h}:00-{h+1}:00"
                 for i, day in enumerate(self.days):

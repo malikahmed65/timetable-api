@@ -2,8 +2,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 import pandas as pd
 from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import os
 from collections import defaultdict
@@ -46,13 +44,11 @@ class TimetableGenerator:
         timetables = defaultdict(list)
         all_rooms = data['rooms'].to_dict('records')
         
-        # Map subjects to teachers and their credit hours
         teacher_map = {}
         for _, row in data['teacher'].iterrows():
             name = str(row.get('Name', row.get('Nmae', ''))).strip()
             courses = str(row.get('courses', '')).split(',')
             try:
-                # Credit hours determines the number of lectures
                 ch = int(row.get('credit hours', 1))
             except:
                 ch = 1
@@ -76,72 +72,66 @@ class TimetableGenerator:
                 teacher = t_data["name"]
                 is_lab = sub.lower().endswith('lab')
                 
-                # Logic: Labs get 3 consecutive slots, Others get slots = credit hours
-                if is_lab:
-                    total_lectures_to_schedule = 1 # One block of 3 hours
-                    duration_per_lecture = 3
-                    display_sub_name = f"{sub} (lab)" if "lab" not in sub.lower() else sub
-                else:
-                    total_lectures_to_schedule = t_data["credit_hours"]
-                    duration_per_lecture = 1
-                    display_sub_name = sub
+                # RULE: Number of consecutive slots = Credit Hours
+                # If it's a lab, you mentioned 3 slots. Otherwise, use credit hours.
+                duration = 3 if is_lab else t_data["credit_hours"]
+                display_sub_name = f"{sub} (lab)" if is_lab and "lab" not in sub.lower() else sub
 
-                # Schedule each required lecture session
-                for _ in range(total_lectures_to_schedule):
-                    scheduled = False
-                    for day in self.days:
-                        if scheduled: break
-                        
-                        # Rule: Teachers ending in "main" start from 9 AM
-                        start_search = 9 if teacher.lower().endswith('main') else 8
-                        
-                        for start_h in range(start_search, 16 - duration_per_lecture + 1):
-                            if any(12 <= h < (14 if day == 'Friday' else 13) for h in range(start_h, start_h + duration_per_lecture)):
-                                continue
-
-                            slots = [f"{h}:00" for h in range(start_h, start_h + duration_per_lecture)]
-                            
-                            found_room = None
-                            for r in all_rooms:
-                                r_id = str(r.get('room id', ''))
-                                r_type = str(r.get('type', '')).lower()
-                                
-                                # Room type matching logic
-                                if is_lab != ('lab' in r_type): continue
-
-                                if all(r_id not in self.room_bookings[day][s] and 
-                                       teacher not in self.teacher_bookings[day][s] and
-                                       section not in self.section_bookings[day][s] for s in slots):
-                                    found_room = r_id
-                                    break
-                            
-                            if found_room:
-                                for s in slots:
-                                    self.room_bookings[day][s].add(found_room)
-                                    self.teacher_bookings[day][s].add(teacher)
-                                    self.section_bookings[day][s].add(section)
-                                
-                                timetables[section].append({
-                                    'day': day, 
-                                    'time': f"{start_h}:00", 
-                                    'end_time': f"{start_h + duration_per_lecture}:00",
-                                    'subject': display_sub_name, 
-                                    'teacher': teacher, 
-                                    'room': f"[{found_room}]"
-                                })
-                                scheduled = True
-                                break
+                scheduled = False
+                for day in self.days:
+                    if scheduled: break
                     
-                    if not scheduled:
-                        raise ValueError("not possible")
+                    # Rule: Teachers ending in "main" start from 9 AM
+                    start_search = 9 if teacher.lower().endswith('main') else 8
+                    
+                    # Search for a block of 'duration' consecutive slots
+                    for start_h in range(start_search, 16 - duration + 1):
+                        # Ensure no part of the block overlaps with the breaks
+                        if any(12 <= h < (14 if day == 'Friday' else 13) for h in range(start_h, start_h + duration)):
+                            continue
+
+                        slots = [f"{h}:00" for h in range(start_h, start_h + duration)]
+                        
+                        found_room = None
+                        for r in all_rooms:
+                            r_id = str(r.get('room id', ''))
+                            r_type = str(r.get('type', '')).lower()
+                            
+                            # Type matching
+                            if is_lab != ('lab' in r_type): continue
+
+                            if all(r_id not in self.room_bookings[day][s] and 
+                                   teacher not in self.teacher_bookings[day][s] and
+                                   section not in self.section_bookings[day][s] for s in slots):
+                                found_room = r_id
+                                break
+                        
+                        if found_room:
+                            for s in slots:
+                                self.room_bookings[day][s].add(found_room)
+                                self.teacher_bookings[day][s].add(teacher)
+                                self.section_bookings[day][s].add(section)
+                            
+                            timetables[section].append({
+                                'day': day, 
+                                'time': f"{start_h}:00", 
+                                'end_time': f"{start_h + duration}:00",
+                                'subject': display_sub_name, 
+                                'teacher': teacher, 
+                                'room': f"[{found_room}]"
+                            })
+                            scheduled = True
+                            break
+                
+                if not scheduled:
+                    raise ValueError("not possible")
 
         return timetables
 
     def generate_word_doc(self, timetables):
         doc = Document()
         for section, entries in sorted(timetables.items()):
-            title = doc.add_heading(f'Section: {section}', level=1)
-            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            doc.add_heading(f'Section: {section}', level=1)
             table = doc.add_table(rows=1, cols=6)
             table.style = 'Table Grid'
             hdr_cells = table.rows[0].cells
@@ -157,12 +147,11 @@ class TimetableGenerator:
 
             for h in range(8, 16):
                 row_cells = table.add_row().cells
-                time_str = f"{h}:00"
                 row_cells[0].text = f"{h}:00 - {h+1}:00"
                 for i, day in enumerate(self.days):
                     if h == 12: row_cells[i+1].text = "BREAK"
                     elif day == 'Friday' and h == 13: row_cells[i+1].text = "JUMMAH"
-                    else: row_cells[i+1].text = lookup[(day, time_str)]
+                    else: row_cells[i+1].text = lookup[(day, f"{h}:00")]
             doc.add_page_break()
         
         out = io.BytesIO()

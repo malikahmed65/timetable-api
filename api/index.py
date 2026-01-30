@@ -52,7 +52,6 @@ class TimetableGenerator:
                 ch = int(row.get('credit hours', 1))
             except:
                 ch = 1
-                
             if not name or name == 'nan' or not courses: 
                 raise ValueError("excel sheet fault")
             for c in courses:
@@ -72,59 +71,66 @@ class TimetableGenerator:
                 teacher = t_data["name"]
                 is_lab = sub.lower().endswith('lab')
                 
-                # RULE: Number of consecutive slots = Credit Hours
-                # If it's a lab, you mentioned 3 slots. Otherwise, use credit hours.
-                duration = 3 if is_lab else t_data["credit_hours"]
-                display_sub_name = f"{sub} (lab)" if is_lab and "lab" not in sub.lower() else sub
+                # Logic: If lab, schedule 2 sessions of 3 hours. Otherwise, 1 session of 'credit_hours'.
+                sessions_to_schedule = []
+                if is_lab:
+                    # Logic for Odd/Even Roll Numbers
+                    sessions_to_schedule.append({"name": f"{sub} (Odd Roll#)", "dur": 3})
+                    sessions_to_schedule.append({"name": f"{sub} (Even Roll#)", "dur": 3})
+                else:
+                    sessions_to_schedule.append({"name": sub, "dur": t_data["credit_hours"]})
 
-                scheduled = False
-                for day in self.days:
-                    if scheduled: break
+                for session_info in sessions_to_schedule:
+                    display_name = session_info["name"]
+                    duration = session_info["dur"]
+                    scheduled = False
                     
-                    # Rule: Teachers ending in "main" start from 9 AM
-                    start_search = 9 if teacher.lower().endswith('main') else 8
-                    
-                    # Search for a block of 'duration' consecutive slots
-                    for start_h in range(start_search, 16 - duration + 1):
-                        # Ensure no part of the block overlaps with the breaks
-                        if any(12 <= h < (14 if day == 'Friday' else 13) for h in range(start_h, start_h + duration)):
-                            continue
-
-                        slots = [f"{h}:00" for h in range(start_h, start_h + duration)]
+                    for day in self.days:
+                        if scheduled: break
                         
-                        found_room = None
-                        for r in all_rooms:
-                            r_id = str(r.get('room id', ''))
-                            r_type = str(r.get('type', '')).lower()
-                            
-                            # Type matching
-                            if is_lab != ('lab' in r_type): continue
+                        # Rule: Teachers ending in "main" skip 8:00 AM
+                        start_search = 9 if teacher.lower().endswith('main') else 8
+                        
+                        for start_h in range(start_search, 16 - duration + 1):
+                            # Break Logic
+                            if any(12 <= h < (14 if day == 'Friday' else 13) for h in range(start_h, start_h + duration)):
+                                continue
 
-                            if all(r_id not in self.room_bookings[day][s] and 
-                                   teacher not in self.teacher_bookings[day][s] and
-                                   section not in self.section_bookings[day][s] for s in slots):
-                                found_room = r_id
+                            slots = [f"{h}:00" for h in range(start_h, start_h + duration)]
+                            
+                            found_room = None
+                            for r in all_rooms:
+                                r_id = str(r.get('room id', ''))
+                                r_type = str(r.get('type', '')).lower()
+                                
+                                # Room type match
+                                if is_lab != ('lab' in r_type): continue
+
+                                if all(r_id not in self.room_bookings[day][s] and 
+                                       teacher not in self.teacher_bookings[day][s] and
+                                       section not in self.section_bookings[day][s] for s in slots):
+                                    found_room = r_id
+                                    break
+                            
+                            if found_room:
+                                for s in slots:
+                                    self.room_bookings[day][s].add(found_room)
+                                    self.teacher_bookings[day][s].add(teacher)
+                                    self.section_bookings[day][s].add(section)
+                                
+                                timetables[section].append({
+                                    'day': day, 
+                                    'time': f"{start_h}:00", 
+                                    'end_time': f"{start_h + duration}:00",
+                                    'subject': display_name, 
+                                    'teacher': teacher, 
+                                    'room': f"[{found_room}]"
+                                })
+                                scheduled = True
                                 break
-                        
-                        if found_room:
-                            for s in slots:
-                                self.room_bookings[day][s].add(found_room)
-                                self.teacher_bookings[day][s].add(teacher)
-                                self.section_bookings[day][s].add(section)
-                            
-                            timetables[section].append({
-                                'day': day, 
-                                'time': f"{start_h}:00", 
-                                'end_time': f"{start_h + duration}:00",
-                                'subject': display_sub_name, 
-                                'teacher': teacher, 
-                                'room': f"[{found_room}]"
-                            })
-                            scheduled = True
-                            break
-                
-                if not scheduled:
-                    raise ValueError("not possible")
+                    
+                    if not scheduled:
+                        raise ValueError("not possible")
 
         return timetables
 

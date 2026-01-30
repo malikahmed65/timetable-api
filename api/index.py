@@ -159,4 +159,34 @@ class TimetableGenerator:
                 row_cells[0].text = f"{h}:00 - {h+1}:00"
                 for i, day in enumerate(self.days):
                     if h == 12: row_cells[i+1].text = "BREAK"
-                    elif day == 'Friday' and h == 13
+                    elif day == 'Friday' and h == 13: row_cells[i+1].text = "JUMMAH"
+                    else: row_cells[i+1].text = lookup[(day, time_str)]
+            doc.add_page_break()
+        
+        out = io.BytesIO()
+        doc.save(out)
+        out.seek(0)
+        return out
+
+@app.post("/download-timetable")
+async def handle_download(file: UploadFile = File(...)):
+    try:
+        gen = TimetableGenerator()
+        data = gen.parse_excel(await file.read())
+        timetables = gen.generate_timetables(data)
+        doc_io = gen.generate_word_doc(timetables)
+        filename = f"Timetable_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        return StreamingResponse(
+            doc_io, 
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", 
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except ValueError as ve:
+        # Returns the specific "not possible" or "excel sheet fault" messages
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception:
+        raise HTTPException(status_code=400, detail="excel sheet fault")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

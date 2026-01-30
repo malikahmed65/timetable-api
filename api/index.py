@@ -21,8 +21,8 @@ app.add_middleware(
 class TimetableGenerator:
     def __init__(self):
         self.days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+        # Slots cover 8 AM to 4 PM (16:00)
         self.hours = list(range(8, 16))
-        # Tracking bookings to ensure no overlaps
         self.room_bookings = defaultdict(lambda: defaultdict(set))
         self.teacher_bookings = defaultdict(lambda: defaultdict(set))
         self.section_bookings = defaultdict(lambda: defaultdict(set))
@@ -31,7 +31,6 @@ class TimetableGenerator:
         try:
             excel_file = pd.ExcelFile(io.BytesIO(file_content), engine='openpyxl')
             required = ['Teacher', 'Sections', 'rooms']
-            # Return strict error if sheets are missing
             if not all(s in excel_file.sheet_names for s in required):
                 raise ValueError("excel sheet fault")
             
@@ -47,7 +46,6 @@ class TimetableGenerator:
         timetables = defaultdict(list)
         all_rooms = data['rooms'].to_dict('records')
         
-        # Build teacher mapping
         teacher_map = {}
         for _, row in data['teacher'].iterrows():
             name = str(row.get('Name', row.get('Nmae', ''))).strip()
@@ -61,7 +59,6 @@ class TimetableGenerator:
             for c in courses:
                 teacher_map[c.strip()] = {"name": name, "credit_hours": ch}
 
-        # Collect and sort sessions: Labs and long blocks go first
         all_sessions = []
         for _, row in data['sections'].iterrows():
             section = str(row.get('Section', '')).strip()
@@ -73,14 +70,14 @@ class TimetableGenerator:
 
                 is_lab = sub.lower().endswith('lab')
                 if is_lab:
-                    # Double lab sessions for Odd/Even Roll Numbers
+                    # Split into Odd and Even roll number sessions
                     all_sessions.append({'section': section, 'name': f"{sub} (Odd Roll#)", 'dur': 3, 'teacher': t_data['name'], 'is_lab': True})
                     all_sessions.append({'section': section, 'name': f"{sub} (Even Roll#)", 'dur': 3, 'teacher': t_data['name'], 'is_lab': True})
                 else:
-                    # Theory sessions match credit hours
+                    # Theory based on credit hours
                     all_sessions.append({'section': section, 'name': sub, 'dur': t_data['credit_hours'], 'teacher': t_data['name'], 'is_lab': False})
 
-        # Sort: Place 3-hour blocks before 1-hour blocks to maximize space usage
+        # CRITICAL: Sort by duration (Longest first) so 3-hour labs get first pick of the days
         all_sessions.sort(key=lambda x: x['dur'], reverse=True)
 
         for session in all_sessions:
@@ -89,27 +86,33 @@ class TimetableGenerator:
             duration = session['dur']
             is_lab = session['is_lab']
             
-            # Search across all days, ignoring "free day" preferences if space is needed
             for day in self.days:
                 if scheduled: break
                 
                 # Rule: Teachers ending in "main" start from 9 AM
                 start_search = 9 if teacher.lower().endswith('main') else 8
                 
-                for start_h in range(start_search, 16 - duration + 1):
-                    # Check break times (12-1 PM Mon-Thu, 12-2 PM Fri)
-                    if any(12 <= h < (14 if day == 'Friday' else 13) for h in range(start_h, start_h + duration)):
+                for start_h in range(start_search, 17 - duration): # Search up to 4 PM
+                    # Strict Break Check: 12-1 PM (Daily) and 12-2 PM (Friday Jummah)
+                    end_h = start_h + duration
+                    has_break_clash = False
+                    for h in range(start_h, end_h):
+                        if h == 12: # Daily Lunch Break
+                            has_break_clash = True
+                        if day == 'Friday' and (h == 12 or h == 13): # Friday Jummah Break
+                            has_break_clash = True
+                    
+                    if has_break_clash:
                         continue
 
-                    slots = [f"{h}:00" for h in range(start_h, start_h + duration)]
+                    slots = [f"{h}:00" for h in range(start_h, end_h)]
                     
-                    # Room selection from rooms sheet
                     found_room = None
                     for r in all_rooms:
                         r_id = str(r.get('room id', ''))
                         r_type = str(r.get('type', '')).lower()
                         
-                        # Match lab sessions to lab rooms
+                        # Match lab sessions to rooms with "lab" in type
                         if is_lab != ('lab' in r_type): continue
 
                         if all(r_id not in self.room_bookings[day][s] and 
@@ -126,7 +129,7 @@ class TimetableGenerator:
                         
                         timetables[session['section']].append({
                             'day': day, 'time': f"{start_h}:00", 
-                            'end_time': f"{start_h + duration}:00",
+                            'end_time': f"{end_h}:00",
                             'subject': session['name'], 'teacher': teacher, 
                             'room': f"[{found_room}]"
                         })
@@ -134,8 +137,7 @@ class TimetableGenerator:
                         break
             
             if not scheduled:
-                # Specific failure message
-                print(f"FAILED: {session['name']} for {session['section']} with {teacher}")
+                print(f"DEBUG FAIL: {session['name']} for {session['section']} (Teacher: {teacher})")
                 raise ValueError("not possible")
 
         return timetables
